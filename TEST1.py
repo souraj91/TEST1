@@ -1,102 +1,89 @@
+import streamlit as st
+import pandas as pd
 import re
 import json
-import numpy as np
-import pandas as pd
-from typing import Optional, Dict, List, Any
 
-# Configuration des priorités pour éviter les recalculs
-PRIO_MAP = {"Certifié": 2, "À valider": 1, "Rejeté": 0}
+# --- CONFIGURATION PAGE ---
+st.set_page_config(page_title="Audit Qualité Passeport", layout="wide")
 
-def _clamp(x: float, lo: int = 0, hi: int = 100) -> int:
-    """Limite une valeur entre lo et hi après arrondi."""
+# --- FONCTIONS UTILITAIRES (Ton code optimisé) ---
+
+def _clamp(x, lo=0, hi=100):
     return int(max(lo, min(hi, round(x))))
 
-def _is_missing(v: Any) -> bool:
-    """Vérifie si une valeur est considérée comme absente."""
-    if pd.isna(v):
-        return True
+def _is_missing(v) -> bool:
+    if pd.isna(v): return True
     s = str(v).strip().lower()
     return s in {"", "—", "none", "null", "nan"}
 
-def _get_value(passport_df: pd.DataFrame, attr: str) -> Optional[Any]:
-    """Récupère la meilleure valeur disponible selon le statut de validation."""
+def _get_value(passport_df, attr):
     sub = passport_df[passport_df["Attribut"] == attr]
-    if sub.empty:
-        return None
+    if sub.empty: return None
+    prio = {"Certifié": 2, "À valider": 1, "Rejeté": 0}
+    sub = sub.assign(prio=sub["Statut de Validation"].map(prio).fillna(0))
+    sub = sub.sort_values("prio", ascending=False)
+    row = sub.iloc[0]
+    return row["Donnée Site"] if row["prio"] > 0 else None
 
-    # Tri par priorité sans créer de colonne temporaire coûteuse
-    sub = sub.assign(prio=sub["Statut de Validation"].get(PRIO_MAP, 0))
-    best_row = sub.sort_values("prio", ascending=False).iloc[0]
-    
-    return best_row["Donnée Site"] if PRIO_MAP.get(best_row["Statut de Validation"], 0) > 0 else None
-
-def _presence(passport_df: pd.DataFrame, attr: str) -> bool:
+def _presence(passport_df, attr):
     return not _is_missing(_get_value(passport_df, attr))
 
-def _presence_prefix(passport_df: pd.DataFrame, prefix: str) -> bool:
-    """Vérifie si au moins un attribut commençant par prefix contient une donnée."""
-    attrs = passport_df.loc[passport_df["Attribut"].astype(str).str.startswith(prefix), "Attribut"].unique()
-    return any(_presence(passport_df, a) for a in attrs)
-
-def _check_format(v: str, length: int) -> bool:
-    """Vérifie si une chaîne est composée de n chiffres."""
-    if _is_missing(v): return False
-    digits = re.sub(r"\D", "", str(v))
-    return len(digits) == length
-
-def score_syntaxe(passport_df: pd.DataFrame, jsonld_gold: Optional[Dict] = None) -> Dict[str, Any]:
-    """
-    Calcule un score de qualité syntaxique et structurelle.
-    """
-    stats = {"warnings": 0, "errors": 0, "hard_gate": 1}
-    
-    # --- Validation JSON-LD (Structure)
-    if jsonld_gold is not None:
-        if not isinstance(jsonld_gold, dict):
-            stats["hard_gate"] = 0
-        else:
-            ctx = jsonld_gold.get("@context", "")
-            typ = jsonld_gold.get("@type", "")
-            
-            if not (isinstance(ctx, str) and ctx.startswith("http")):
-                stats["hard_gate"] = 0
-            if typ != "Organization":
-                stats["hard_gate"] = 0
-            
-            # Warnings de structure
-            if "name" not in jsonld_gold: stats["warnings"] += 1
-            if "identifier" in jsonld_gold and not isinstance(jsonld_gold["identifier"], (list, dict)):
-                stats["warnings"] += 1
-    else:
-        stats["warnings"] += 2 # Pénalité pour absence de source JSON-LD
-
-    if stats["hard_gate"] == 0:
-        return {"score": 0, "details": stats}
-
-    # --- Validation des données (Métier)
+def score_syntaxe(passport_df):
+    """Calcule le score et retourne les détails"""
+    warnings = 0
+    # Vérification simplifiée pour l'exemple
     has_name = _presence(passport_df, "name")
-    has_url = _presence(passport_df, "url") or _presence_prefix(passport_df, "subjectOf")
-    has_ids = _presence(passport_df, "identifier.siren") or _presence_prefix(passport_df, "identifier.siret")
-
-    required_ok = 1 if (has_name and has_url) else 0
+    has_url = _presence(passport_df, "url")
     
-    # Validation formats SIREN/SIRET
-    siren = _get_value(passport_df, "identifier.siren")
-    if siren and not _check_format(siren, 9): stats["warnings"] += 2
+    if not has_name: warnings += 2
+    if not has_url: warnings += 2
     
-    sirets = passport_df.loc[passport_df["Attribut"].astype(str).str.startswith("identifier.siret"), "Attribut"]
-    for s in sirets:
-        if not _check_format(_get_value(passport_df, s), 14):
-            stats["warnings"] += 1
-
-    # --- Calcul du Score Final
-    score = 100 - (15 * (1 - required_ok)) - (5 * stats["warnings"]) - (25 * stats["errors"])
-    
+    score = 100 - (warnings * 10)
     return {
         "score": _clamp(score),
-        "details": {
-            **stats,
-            "required_fields_ok": required_ok,
-            "has_identifiers": int(has_ids)
-        }
+        "details": {"warnings": warnings, "has_name": has_name, "has_url": has_url}
     }
+
+# --- INTERFACE STREAMLIT ---
+
+st.title("🛡️ Audit de Conformité Passeport")
+st.write("Uploadez votre fichier exporté pour calculer le score de syntaxe.")
+
+uploaded_file = st.file_uploader("Choisir un fichier CSV", type="csv")
+
+if uploaded_file is not None:
+    try:
+        df = pd.read_csv(uploaded_file)
+        
+        # Vérification des colonnes nécessaires
+        required_cols = ["Attribut", "Statut de Validation", "Donnée Site"]
+        if all(col in df.columns for col in required_cols):
+            
+            # Calcul du score
+            result = score_syntaxe(df)
+            
+            # Affichage des résultats
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Score de Syntaxe", f"{result['score']}/100")
+            
+            with col2:
+                if result['score'] > 80:
+                    st.success("Qualité Excellente")
+                elif result['score'] > 50:
+                    st.warning("Qualité Moyenne")
+                else:
+                    st.error("Qualité Insuffisante")
+            
+            st.divider()
+            st.subheader("Détails de l'audit")
+            st.write(result['details'])
+            st.dataframe(df) # Affiche le tableau pour vérifier
+            
+        else:
+            st.error(f"Le fichier doit contenir les colonnes : {', '.join(required_cols)}")
+            
+    except Exception as e:
+        st.error(f"Erreur lors de la lecture du fichier : {e}")
+else:
+    st.info("En attente d'un fichier CSV...")
